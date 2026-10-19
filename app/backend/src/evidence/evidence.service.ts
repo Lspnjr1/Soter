@@ -1,15 +1,12 @@
-import {
-  Injectable,
-  Logger,
-  NotFoundException,
-  BadRequestException,
-} from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { EncryptionService } from '../common/encryption/encryption.service';
 import { AuditService } from '../audit/audit.service';
 import { FingerprintService } from './fingerprint.service';
 import { StorageService } from './storage/storage.service';
 import { StorageError } from './storage/storage.errors';
+import { MetricsService } from '../observability/metrics/metrics.service';
 import * as fs from 'fs/promises';
 import { existsSync, mkdirSync } from 'fs';
 import * as path from 'path';
@@ -27,6 +24,7 @@ export class EvidenceService {
     private readonly auditService: AuditService,
     private readonly fingerprintService: FingerprintService,
     private readonly storageService: StorageService,
+    private readonly metricsService: MetricsService,
   ) {
     // Ensure staging directory exists (encrypted bytes land here before the
     // durable upload to the configured StorageDriver).
@@ -75,7 +73,9 @@ export class EvidenceService {
           orgId,
         },
       });
-      throw new BadRequestException(
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
         'File already exists in queue for this organization',
       );
     }
@@ -206,6 +206,12 @@ export class EvidenceService {
         data: { status: EvidenceStatus.completed, storageKey },
       });
 
+      // SLA: time from intake (queued) to a terminal decision (completed).
+      this.metricsService.recordEvidenceIntakeToDecisionDuration(
+        EvidenceStatus.completed,
+        (Date.now() - item.createdAt.getTime()) / 1000,
+      );
+
       // Remove the staging file now that the durable copy exists.
       try {
         await fs.unlink(stagingPath);
@@ -235,6 +241,12 @@ export class EvidenceService {
         },
       });
 
+      // SLA: time from intake (queued) to a terminal decision (failed).
+      this.metricsService.recordEvidenceIntakeToDecisionDuration(
+        EvidenceStatus.failed,
+        (Date.now() - item.createdAt.getTime()) / 1000,
+      );
+
       // Re-throw so callers (and tests) can assert on the typed failure.
       throw err instanceof StorageError
         ? err
@@ -254,10 +266,19 @@ export class EvidenceService {
       where: { id, ownerId },
     });
 
-    if (!item) throw new NotFoundException('Queue item not found');
+    if (!item)
+      throw new AppException(
+        ERROR_CODES.NOT_FOUND,
+        404,
+        'Queue item not found',
+      );
 
     if (item.status === EvidenceStatus.completed) {
-      throw new BadRequestException('Item already uploaded');
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Item already uploaded',
+      );
     }
 
     await this.prisma.evidenceQueueItem.update({
@@ -275,7 +296,12 @@ export class EvidenceService {
       where: { id, ownerId },
     });
 
-    if (!item) throw new NotFoundException('Queue item not found');
+    if (!item)
+      throw new AppException(
+        ERROR_CODES.NOT_FOUND,
+        404,
+        'Queue item not found',
+      );
 
     // Delete the durably stored artifact from the StorageDriver, if present.
     if (item.storageKey) {
